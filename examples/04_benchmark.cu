@@ -2,9 +2,10 @@
 // GFD vs cudaMemcpy Benchmark
 //
 // Compares scattered H2D transfer performance across methods:
-//   1. cudaMemcpy(N):  Per-token cudaMemcpyAsync (realistic scattered)
-//   2. GFD Queue:      GPU submit descriptors -> CPU poll -> CE DMA
-//   3. GFD Direct:     CPU direct-submit (bypass queue, small transfers)
+//   1. cudaMemcpy(N):      Per-token cudaMemcpyAsync (realistic scattered)
+//   2. cudaMemcpyBatch:    CUDA 12.8+ batch API (single call, N transfers)
+//   3. GFD Queue:          GPU submit descriptors -> CPU poll -> CE DMA
+//   4. GFD Direct:         CPU direct-submit (bypass queue, small transfers)
 //
 // Uses submit+wait kernel split: submit kernel writes descriptors
 // and exits immediately, wait kernel polls for completion.
@@ -113,6 +114,51 @@ static TimingStats bench_memcpy_per_token(
     return compute_stats(times);
 }
 
+// cudaMemcpyBatchAsync: single API call for N scattered transfers (CUDA 12.8+)
+static TimingStats bench_memcpy_batch(
+    void* gpu_dst, const uint64_t* cpu_addrs,
+    int num_tokens, size_t token_size, cudaStream_t stream)
+{
+    // Build dst/src/size arrays
+    std::vector<void*> dsts(num_tokens);
+    std::vector<const void*> srcs(num_tokens);
+    std::vector<size_t> sizes(num_tokens);
+    for (int t = 0; t < num_tokens; t++) {
+        dsts[t] = (char*)gpu_dst + (size_t)t * token_size;
+        srcs[t] = (const void*)cpu_addrs[t];
+        sizes[t] = token_size;
+    }
+
+    // Attribute: source is pinned host memory (stream-ordered access)
+    cudaMemcpyAttributes attr = {};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attr.flags = 0;
+    // All entries share the same attribute (index 0)
+    std::vector<size_t> attrIdxs(num_tokens, 0);
+
+    for (int i = 0; i < WARMUP; i++) {
+        cudaMemcpyBatchAsync(
+            (void* const*)dsts.data(),
+            (const void* const*)srcs.data(),
+            sizes.data(), num_tokens,
+            &attr, attrIdxs.data(), 1, stream);
+        cudaStreamSynchronize(stream);
+    }
+    std::vector<double> times(ITERS);
+    for (int i = 0; i < ITERS; i++) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        cudaMemcpyBatchAsync(
+            (void* const*)dsts.data(),
+            (const void* const*)srcs.data(),
+            sizes.data(), num_tokens,
+            &attr, attrIdxs.data(), 1, stream);
+        cudaStreamSynchronize(stream);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        times[i] = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    }
+    return compute_stats(times);
+}
+
 // GFD Queue: submit + wait (split kernels, no GPU spin during DMA)
 static TimingStats bench_gfd_queue(
     gfd::DescriptorQueue* queue, gfd::TokenInfo* d_tokens,
@@ -162,6 +208,7 @@ struct Result {
     int    token_bytes;
     size_t total_bytes;
     TimingStats mcN;   // cudaMemcpy per-token
+    TimingStats batch; // cudaMemcpyBatchAsync
     TimingStats gfd;   // GFD queue (submit+wait)
     TimingStats dir;   // GFD direct (p50 < 0 if skipped)
 };
@@ -170,12 +217,12 @@ struct Result {
 
 static void print_latency_table(const std::vector<Result>& results, const char* pct_label,
                                  double TimingStats::*field) {
-    printf("+-----------------+--------+------------+------------+------------+\n");
-    printf("| %-15s | %6s | %10s | %10s | %10s |\n",
-           "Config", "Total", "Memcpy(N)", "GFD Queue", "GFD Direct");
-    printf("| %-15s | %6s | %10s | %10s | %10s |\n",
-           "", "", pct_label, pct_label, pct_label);
-    printf("+-----------------+--------+------------+------------+------------+\n");
+    printf("+-----------------+--------+------------+------------+------------+------------+\n");
+    printf("| %-15s | %6s | %10s | %10s | %10s | %10s |\n",
+           "Config", "Total", "Memcpy(N)", "BatchAsync", "GFD Queue", "GFD Direct");
+    printf("| %-15s | %6s | %10s | %10s | %10s | %10s |\n",
+           "", "", pct_label, pct_label, pct_label, pct_label);
+    printf("+-----------------+--------+------------+------------+------------+------------+\n");
 
     for (auto& r : results) {
         char tok_str[16], tot_str[16], label[24];
@@ -184,23 +231,23 @@ static void print_latency_table(const std::vector<Result>& results, const char* 
         snprintf(label, sizeof(label), "%d x %s", r.num_tokens, tok_str);
 
         if (r.dir.*field > 0) {
-            printf("| %-15s | %6s | %10.1f | %10.1f | %10.1f |\n",
-                   label, tot_str, r.mcN.*field, r.gfd.*field, r.dir.*field);
+            printf("| %-15s | %6s | %10.1f | %10.1f | %10.1f | %10.1f |\n",
+                   label, tot_str, r.mcN.*field, r.batch.*field, r.gfd.*field, r.dir.*field);
         } else {
-            printf("| %-15s | %6s | %10.1f | %10.1f | %10s |\n",
-                   label, tot_str, r.mcN.*field, r.gfd.*field, "-");
+            printf("| %-15s | %6s | %10.1f | %10.1f | %10.1f | %10s |\n",
+                   label, tot_str, r.mcN.*field, r.batch.*field, r.gfd.*field, "-");
         }
     }
-    printf("+-----------------+--------+------------+------------+------------+\n");
+    printf("+-----------------+--------+------------+------------+------------+------------+\n");
 }
 
 static void print_bandwidth_table(const std::vector<Result>& results) {
-    printf("+-----------------+--------+------------+------------+------------+\n");
-    printf("| %-15s | %6s | %10s | %10s | %10s |\n",
-           "Config", "Total", "Memcpy(N)", "GFD Queue", "GFD Direct");
-    printf("| %-15s | %6s | %10s | %10s | %10s |\n",
-           "", "", "GB/s", "GB/s", "GB/s");
-    printf("+-----------------+--------+------------+------------+------------+\n");
+    printf("+-----------------+--------+------------+------------+------------+------------+\n");
+    printf("| %-15s | %6s | %10s | %10s | %10s | %10s |\n",
+           "Config", "Total", "Memcpy(N)", "BatchAsync", "GFD Queue", "GFD Direct");
+    printf("| %-15s | %6s | %10s | %10s | %10s | %10s |\n",
+           "", "", "GB/s", "GB/s", "GB/s", "GB/s");
+    printf("+-----------------+--------+------------+------------+------------+------------+\n");
 
     for (auto& r : results) {
         char tok_str[16], tot_str[16], label[24];
@@ -209,18 +256,19 @@ static void print_bandwidth_table(const std::vector<Result>& results) {
         snprintf(label, sizeof(label), "%d x %s", r.num_tokens, tok_str);
 
         double bw_mcN = r.total_bytes / (r.mcN.p50 * 1e3);
+        double bw_batch = r.total_bytes / (r.batch.p50 * 1e3);
         double bw_gfd = r.total_bytes / (r.gfd.p50 * 1e3);
 
         if (r.dir.p50 > 0) {
             double bw_dir = r.total_bytes / (r.dir.p50 * 1e3);
-            printf("| %-15s | %6s | %10.2f | %10.2f | %10.2f |\n",
-                   label, tot_str, bw_mcN, bw_gfd, bw_dir);
+            printf("| %-15s | %6s | %10.2f | %10.2f | %10.2f | %10.2f |\n",
+                   label, tot_str, bw_mcN, bw_batch, bw_gfd, bw_dir);
         } else {
-            printf("| %-15s | %6s | %10.2f | %10.2f | %10s |\n",
-                   label, tot_str, bw_mcN, bw_gfd, "-");
+            printf("| %-15s | %6s | %10.2f | %10.2f | %10.2f | %10s |\n",
+                   label, tot_str, bw_mcN, bw_batch, bw_gfd, "-");
         }
     }
-    printf("+-----------------+--------+------------+------------+------------+\n");
+    printf("+-----------------+--------+------------+------------+------------+------------+\n");
 }
 
 // ============================================================
@@ -390,10 +438,10 @@ int main() {
         r.num_tokens  = N;
         r.token_bytes = T;
         r.total_bytes = total;
-        r.mcN = bench_memcpy_per_token(gpu_buf, h_cpu_addrs.data(), N, T, bench_stream);
-        r.gfd = bench_gfd_queue(d_queue, d_tokens, gpu_buf, N, T, gfd_base_slot);
-        r.dir = {-1.0, -1.0};
-        r.dir = bench_gfd_direct(poller, h_sg_entries.data(), N);
+        r.mcN   = bench_memcpy_per_token(gpu_buf, h_cpu_addrs.data(), N, T, bench_stream);
+        r.batch = bench_memcpy_batch(gpu_buf, h_cpu_addrs.data(), N, T, bench_stream);
+        r.gfd   = bench_gfd_queue(d_queue, d_tokens, gpu_buf, N, T, gfd_base_slot);
+        r.dir   = bench_gfd_direct(poller, h_sg_entries.data(), N);
 
         return r;
     };
@@ -474,9 +522,10 @@ int main() {
     // ---- Legend ----
     printf("\n");
     printf("Legend:\n");
-    printf("  Memcpy(N)  : N individual cudaMemcpyAsync from scattered CPU addresses\n");
-    printf("  GFD Queue  : GPU submit descriptors (fire-and-forget) + wait kernel\n");
-    printf("  GFD Direct : CPU direct-submit, bypass queue (parallel gather)\n");
+    printf("  Memcpy(N)   : N individual cudaMemcpyAsync from scattered CPU addresses\n");
+    printf("  BatchAsync  : cudaMemcpyBatchAsync (single API call, N transfers)\n");
+    printf("  GFD Queue   : GPU submit descriptors (fire-and-forget) + wait kernel\n");
+    printf("  GFD Direct  : CPU direct-submit, bypass queue (parallel gather)\n");
 
     // ---- Cleanup ----
     poller.stop();
@@ -489,3 +538,4 @@ int main() {
 
     return 0;
 }
+
